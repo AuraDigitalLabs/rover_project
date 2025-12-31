@@ -15,7 +15,9 @@
 #define LORA_DIO0           2
 
 // ========== LORA CONFIGURATION ==========
-#define LORA_FREQUENCY      915E6    // 915 MHz (US) or 868E6 (EU)
+#ifndef LORA_FREQUENCY
+#define LORA_FREQUENCY      433E6    // 433 MHz
+#endif
 #define LORA_TX_POWER       20       // dBm
 #define LORA_SPREADING_FACTOR 7      // 7-12
 #define LORA_BANDWIDTH      125E3

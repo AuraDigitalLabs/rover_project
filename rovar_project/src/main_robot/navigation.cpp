@@ -64,15 +64,6 @@ void updateNavigation() {
   }
 }
 
-void stopMotors() {
-  digitalWrite(MOTOR_LEFT_IN1, LOW);
-  digitalWrite(MOTOR_LEFT_IN2, LOW);
-  digitalWrite(MOTOR_RIGHT_IN1, LOW);
-  digitalWrite(MOTOR_RIGHT_IN2, LOW);
-  analogWrite(MOTOR_LEFT_PWM, 0);
-  analogWrite(MOTOR_RIGHT_PWM, 0);
-}
-
 void moveForward(int speed) {
   if (!motorsEnabled) return;
   speed = constrain(speed, 0, 255);

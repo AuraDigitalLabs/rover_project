@@ -1,70 +1,87 @@
 /*
  * MAIN ROBOT FIRMWARE
  * Environmental monitoring rover with sensors and navigation
+ * 
+ * Initialization Order:
+ * 1. ESP-NOW receiver (remote control)
+ * 2. LoRa communication
+ * 3. Sensors initialization
+ * 4. Start transmitting sensor data
  */
 
 #include <Arduino.h>
-#include "lora_link.h"
+#include <Arduino.h>
+#include <LoRa.h>
+#include "mainrobot_lora_init.h"
 #include "protocol.h"
 #include "app_config.h"
 #include "main_config.h"
-#include "sensors.h"
-#include "navigation.h"
+#include "motor_control.h"
+#include "wifi_mqtt_handler.h"
+#include "sensor_init.h"
+#include "esp_now_receiver.h"
 
 // Forward declarations
 void handleLoRaPacket(LoRaPacket* packet);
-void collectSensorData();
-void transmitData();
-void syncWithSubRobot();
-void printStatus();
+bool sendLoRaPacket(uint8_t type, const char* data);
+bool receiveLoRaPacket(LoRaPacket* packet);
+void readIMUData(float& accelX, float& accelY, float& accelZ, float& gyroX, float& gyroY, float& gyroZ);
 
 // LoRa communication
-LoRaLink loraLink;
+uint16_t loraPacketCounter = 0;
+uint16_t loraCounter = 0;
 
 // Timing variables
-unsigned long lastSampleTime = 0;
-unsigned long lastTransmitTime = 0;
-unsigned long lastSyncTime = 0;
-unsigned long lastStatusTime = 0;
-
-// Data buffer
-String dataBuffer[10];
-int bufferIndex = 0;
+unsigned long lastSensorTransmit = 0;
+#define SENSOR_TRANSMIT_INTERVAL 5000  // Transmit every 5 seconds
 
 void setup() {
   Serial.begin(115200);
   delay(1000);
   
-  Serial.println("====================================");
-  Serial.println("   MAIN ROBOT - Environmental Rover");
-  Serial.println("====================================");
+  Serial.println("\n====================================");
+  Serial.println("   MAIN ROBOT - Starting...");
+  Serial.println("====================================\n");
   
   // Status LED
   pinMode(STATUS_LED, OUTPUT);
   digitalWrite(STATUS_LED, HIGH);
   
-  // Initialize LoRa
-  if (!loraLink.begin(LORA_FREQUENCY, LORA_CS, LORA_RST, LORA_DIO0)) {
-    Serial.println("FATAL: LoRa initialization failed!");
+  // Initialize motors
+  initMotors();
+  
+  // ===== STEP 1: ESP-NOW RECEIVER =====
+  Serial.println("[STEP 1] Initializing Remote Control (ESP-NOW)...");
+  if (!initESPNowReceiver()) {
+    Serial.println("[ERROR] ESP-NOW initialization failed!");
+  }
+  delay(500);
+  
+  // ===== STEP 2: LoRa INITIALIZATION =====
+  Serial.println("[STEP 2] Initializing LoRa Communication...");
+  if (!initMainRobotLoRa()) {
+    Serial.println("[ERROR] LoRa initialization failed!");
     while (1) {
       digitalWrite(STATUS_LED, !digitalRead(STATUS_LED));
       delay(200);
     }
   }
+  mainRobotLoRaStartReceive();
+  Serial.println("[LoRa] Establishment done - Ready to send data");
+  delay(500);
   
-  loraLink.setConfiguration(LORA_TX_POWER, LORA_SPREADING_FACTOR, LORA_SYNC_WORD);
+  // ===== STEP 3: SENSORS INITIALIZATION =====
+  Serial.println("[STEP 3] Initializing Sensors...");
+  if (!initSensors()) {
+    Serial.println("[ERROR] Sensor initialization failed!");
+  }
+  printSensorStatus();
+  delay(500);
   
-  // Initialize sensors
-  initSensors();
-  
-  // Initialize navigation
-  initNavigation();
-  
-  // TODO: Initialize WiFi/MQTT
-  Serial.println("WiFi/MQTT: Not initialized (TODO)");
-  
-  Serial.println("Main Robot Ready!");
+  // All systems ready
   Serial.println("====================================");
+  Serial.println("[READY] All systems initialized!");
+  Serial.println("====================================\n");
   
   digitalWrite(STATUS_LED, LOW);
 }
@@ -72,149 +89,173 @@ void setup() {
 void loop() {
   unsigned long currentTime = millis();
   
+  // Check if remote is connected
+  static bool remoteStatusPrinted = false;
+  if (isRemoteConnected() && !remoteStatusPrinted) {
+    Serial.println("\n>>> Remote control is connected - Now you can control the robot <<<\n");
+    remoteStatusPrinted = true;
+  } else if (!isRemoteConnected() && remoteStatusPrinted) {
+    Serial.println("\n>>> Remote control disconnected <<<\n");
+    stopMotors();
+    remoteStatusPrinted = false;
+  }
+  
+  // ===== MOTOR CONTROL FROM JOYSTICK =====
+  // Check if we have joystick data and remote is connected
+  if (isRemoteConnected()) {
+    JoystickData joyData = {0, 0, false};
+    if (espNowReadJoystick(joyData)) {
+      // Process joystick input and control motors
+      handleJoystickInput(joyData);
+    }
+  } else {
+    // No remote connection - ensure motors are stopped
+    stopMotors();
+  }
+  
   // Handle incoming LoRa packets
   LoRaPacket packet;
-  if (loraLink.receivePacket(&packet)) {
+  if (receiveLoRaPacket(&packet)) {
     handleLoRaPacket(&packet);
   }
   
-  // Update navigation (obstacle avoidance, GPS)
-  updateNavigation();
-  
-  // Check battery and return home if needed
-  checkReturnHome();
-  
-  // Collect sensor data periodically
-  if (currentTime - lastSampleTime >= SAMPLE_INTERVAL) {
-    lastSampleTime = currentTime;
-    collectSensorData();
+  // Transmit sensor data periodically
+  if (currentTime - lastSensorTransmit >= SENSOR_TRANSMIT_INTERVAL) {
+    lastSensorTransmit = currentTime;
+    
+    // Read sensors
+    SensorReadings readings = readAllSensors();
+    
+    // Read IMU data
+    float accelX, accelY, accelZ, gyroX, gyroY, gyroZ;
+    readIMUData(accelX, accelY, accelZ, gyroX, gyroY, gyroZ);
+    
+    // Print sensor values to Serial
+    Serial.print("[SENSORS] Temp: ");
+    Serial.print(readings.temperature, 1);
+    Serial.print("°C | Humidity: ");
+    Serial.print(readings.humidity, 1);
+    Serial.print("% | Gas: ");
+    Serial.print(readings.airQuality, 1);
+    Serial.print("% | Soil: ");
+    Serial.print(readings.soilMoisture, 1);
+    Serial.print("% | GPS: ");
+    Serial.print(readings.latitude, 6);
+    Serial.print(",");
+    Serial.println(readings.longitude, 6);
+    
+    Serial.print("[IMU] Accel: ");
+    Serial.print(accelX, 2);
+    Serial.print(",");
+    Serial.print(accelY, 2);
+    Serial.print(",");
+    Serial.print(accelZ, 2);
+    Serial.print(" | Gyro: ");
+    Serial.print(gyroX, 2);
+    Serial.print(",");
+    Serial.print(gyroY, 2);
+    Serial.print(",");
+    Serial.println(gyroZ, 2);
+    
+    // Transmit via LoRa (TEMP, HUM, GAS, SOIL, GPS, and IMU)
+    char loraPayload[256];
+    snprintf(loraPayload, sizeof(loraPayload),
+      "TEMP:%.1f,HUM:%.1f,GAS:%.1f,SOIL:%.1f,LAT:%.6f,LNG:%.6f,AX:%.2f,AY:%.2f,AZ:%.2f,GX:%.2f,GY:%.2f,GZ:%.2f",
+      readings.temperature, readings.humidity, readings.airQuality, readings.soilMoisture,
+      readings.latitude, readings.longitude,
+      accelX, accelY, accelZ, gyroX, gyroY, gyroZ);
+    
+    Serial.print("[LoRa TX] Transmitting: ");
+    Serial.println(loraPayload);
+    
+    bool txSuccess = sendLoRaPacket(PKT_DATA, loraPayload);
+    
+    if (txSuccess) {
+      Serial.println("[LoRa TX] SUCCESS");
+    } else {
+      Serial.println("[LoRa TX] FAILED");
+    }
+    
+    // Blink LED on transmission
+    digitalWrite(STATUS_LED, HIGH);
+    delay(100);
+    digitalWrite(STATUS_LED, LOW);
   }
   
-  // Transmit data periodically
-  if (currentTime - lastTransmitTime >= TRANSMIT_INTERVAL) {
-    lastTransmitTime = currentTime;
-    transmitData();
-  }
-  
-  // Sync with sub-robot periodically
-  if (currentTime - lastSyncTime >= SYNC_INTERVAL) {
-    lastSyncTime = currentTime;
-    syncWithSubRobot();
-  }
-  
-  // Print status periodically
-  if (currentTime - lastStatusTime >= 5000) {
-    lastStatusTime = currentTime;
-    printStatus();
-  }
-  
-  delay(10);
+  delay(20);
 }
 
 void handleLoRaPacket(LoRaPacket* packet) {
   switch (packet->type) {
-    case PKT_PONG:
-      Serial.println("Received PONG from sub-robot");
-      break;
-      
     case PKT_STATUS:
-      Serial.print("Sub-robot status: ");
+      Serial.print("[LoRa RX] Sub-robot status: ");
       Serial.println(packet->data);
       break;
       
     case PKT_DATA:
-      Serial.print("Sub-robot data: ");
+      Serial.print("[LoRa RX] Sub-robot data: ");
       Serial.println(packet->data);
-      // TODO: Forward to cloud
-      break;
-      
-    case PKT_SYNC_RESPONSE:
-      Serial.println("Sync response received");
       break;
       
     default:
-      Serial.print("Unknown packet type: ");
-      Serial.println(packet->type, HEX);
+      Serial.print("[LoRa RX] Packet type 0x");
+      Serial.print(packet->type, HEX);
+      Serial.print(": ");
+      Serial.println(packet->data);
   }
 }
 
-void collectSensorData() {
-  Serial.println("Collecting sensor data...");
-  
-  // Update all sensors
-  updateSensors();
-  
-  // Get JSON data
-  String jsonData = getSensorDataJSON();
-  
-  // Store in buffer
-  dataBuffer[bufferIndex] = jsonData;
-  bufferIndex = (bufferIndex + 1) % 10;
-  
-  Serial.println("Data collected:");
-  Serial.println(jsonData);
-  
-  // Send to sub-robot for backup
-  loraLink.sendPacket(PKT_DATA, jsonData.c_str());
-}
-
-void transmitData() {
-  Serial.println("Transmitting data...");
-  
-  // TODO: Send buffered data via MQTT if WiFi connected
-  // if (isWiFiConnected()) {
-  //   for (int i = 0; i < 10; i++) {
-  //     if (dataBuffer[i].length() > 0) {
-  //       publishMQTT(dataBuffer[i]);
-  //     }
-  //   }
-  // }
-  
-  Serial.println("WiFi/MQTT not implemented yet");
-}
-
-void syncWithSubRobot() {
-  Serial.println("Syncing with sub-robot...");
-  
-  // Send sync request
-  loraLink.sendPacket(PKT_SYNC_REQUEST, "SYNC");
-  
-  // Send status request
-  delay(100);
-  loraLink.sendPacket(PKT_COMMAND, CMD_GET_STATUS);
-}
-
-void printStatus() {
-  SensorData data = getSensorData();
-  
-  Serial.println("\n===== ROVER STATUS =====");
-  Serial.print("Battery: ");
-  Serial.print(data.batteryPercent, 1);
-  Serial.print("% (");
-  Serial.print(data.batteryVoltage, 2);
-  Serial.println("V)");
-  
-  Serial.print("GPS: ");
-  if (data.gpsValid) {
-    Serial.print(data.latitude, 6);
-    Serial.print(", ");
-    Serial.println(data.longitude, 6);
-  } else {
-    Serial.println("No fix");
+bool sendLoRaPacket(uint8_t type, const char* data) {
+  uint8_t buffer[4 + MAX_DATA_SIZE];
+  size_t dataLen = strlen(data);
+  if (dataLen > MAX_DATA_SIZE) {
+    dataLen = MAX_DATA_SIZE;
   }
+
+  buffer[0] = type;
+  buffer[1] = (uint8_t)(loraPacketCounter >> 8);
+  buffer[2] = (uint8_t)(loraPacketCounter & 0xFF);
+  buffer[3] = (uint8_t)dataLen;
+  memcpy(&buffer[4], data, dataLen);
+
+  Serial.print("[LoRa Internal] Sending packet type 0x");
+  Serial.print(type, HEX);
+  Serial.print(" len ");
+  Serial.println(dataLen);
   
-  Serial.print("Air: ");
-  Serial.print(data.airTemp, 1);
-  Serial.print("°C, ");
-  Serial.print(data.airHumidity, 0);
-  Serial.println("%");
+  int state = mainRobotLoRaTransmitPacket(buffer, 4 + dataLen);
+  mainRobotLoRaStartReceive();
   
-  Serial.print("Obstacle: ");
-  Serial.print(getFrontDistance(), 0);
-  Serial.println(" cm");
-  
-  Serial.print("LoRa RSSI: ");
-  Serial.print(loraLink.getRSSI());
-  Serial.println(" dBm");
-  Serial.println("========================\n");
+  if (!state) {
+    Serial.print("[LoRa Internal] TX error");
+    return false;
+  }
+
+  loraPacketCounter++;
+  return true;
+}
+
+bool receiveLoRaPacket(LoRaPacket* packet) {
+  if (!mainRobotLoRaAvailable()) {
+    return false;
+  }
+
+  uint8_t buffer[MAX_PACKET_SIZE];
+  int state = mainRobotLoRaRead(buffer, sizeof(buffer));
+  mainRobotLoRaStartReceive();
+
+  // LoRa library doesn't use state codes like RadioLib
+
+  uint8_t dataLen = buffer[3];
+  if (dataLen > MAX_DATA_SIZE) {
+    Serial.println("[LoRa RX] Invalid data length");
+    return false;
+  }
+
+  packet->type = buffer[0];
+  packet->counter = (uint16_t)((buffer[1] << 8) | buffer[2]);
+  packet->dataLen = dataLen;
+  memcpy(packet->data, &buffer[4], dataLen);
+  packet->data[dataLen] = '\0';
+  return true;
 }
